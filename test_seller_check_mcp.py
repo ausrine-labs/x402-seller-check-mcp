@@ -96,6 +96,10 @@ class Protocol(unittest.TestCase):
     def test_notification_gets_no_reply(self):
         self.assertIsNone(m.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
 
+    def test_null_id_still_gets_a_reply(self):
+        r = m.handle({"jsonrpc": "2.0", "id": None, "method": "ping"})
+        self.assertEqual(r, {"jsonrpc": "2.0", "id": None, "result": {}})
+
     def test_unknown_method_and_tool(self):
         self.assertEqual(m.handle({"jsonrpc": "2.0", "id": 3, "method": "nope"})["error"]["code"], -32601)
         self.assertEqual(call_raw("nope")["error"]["code"], -32602)

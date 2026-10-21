@@ -198,7 +198,7 @@ TOOLS = {
 def handle(msg):
     """One JSON-RPC message in, one response out (or None for a notification)."""
     method, mid = msg.get("method"), msg.get("id")
-    if mid is None:
+    if "id" not in msg:        # a notification has no id member at all; "id": null still gets an answer
         return None
     if method == "initialize":
         result = {"protocolVersion": PROTOCOL, "capabilities": {"tools": {}},
