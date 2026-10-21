@@ -96,6 +96,11 @@ class Protocol(unittest.TestCase):
     def test_notification_gets_no_reply(self):
         self.assertIsNone(m.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
 
+    def test_non_object_params_are_refused(self):
+        for params in ([], "bad", {"name": "top_sellers", "arguments": [1]}):
+            r = m.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": params})
+            self.assertEqual(r["error"]["code"], -32602)
+
     def test_null_id_still_gets_a_reply(self):
         r = m.handle({"jsonrpc": "2.0", "id": None, "method": "ping"})
         self.assertEqual(r, {"jsonrpc": "2.0", "id": None, "result": {}})

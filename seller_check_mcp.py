@@ -209,11 +209,14 @@ def handle(msg):
         result = {"tools": [dict(name=n, **spec) for n, (_, spec) in TOOLS.items()]}
     elif method == "tools/call":
         params = msg.get("params") or {}
+        args = params.get("arguments") or {} if isinstance(params, dict) else None
+        if not isinstance(args, dict):
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "params and arguments must be objects"}}
         entry = TOOLS.get(params.get("name"))
         if not entry:
             return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": "unknown tool"}}
         try:
-            text, err = entry[0](params.get("arguments") or {}), False
+            text, err = entry[0](args), False
         except ValueError as e:
             text, err = str(e), True
         except Exception as e:  # network trouble: say so plainly, never guess an answer
@@ -235,8 +238,12 @@ def main():
         except json.JSONDecodeError:
             out = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
         else:
-            out = handle(msg) if isinstance(msg, dict) else {
-                "jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+            try:
+                out = handle(msg) if isinstance(msg, dict) else {
+                    "jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+            except Exception:  # one malformed request must never stop the server
+                out = {"jsonrpc": "2.0", "id": msg.get("id") if isinstance(msg, dict) else None,
+                       "error": {"code": -32603, "message": "internal error"}}
         if out is not None:
             sys.stdout.write(json.dumps(out) + "\n")
             sys.stdout.flush()
