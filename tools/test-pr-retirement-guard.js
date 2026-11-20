@@ -50,11 +50,12 @@ function receiptComment(overrides = {}) {
 
 function harness({ comments = [], files = [{ filename: 'docs/example.md' }], ref = null,
   pullOverrides = {}, refHeads = [], graphqlOverride = {}, graphqlFails = false,
-  reopenedHead, reopenedState = 'open' } = {}) {
+  reopenedHead, reopenedState = 'open', currentPullOverrides = {}, currentPulls = [] } = {}) {
   const calls = [];
   const listComments = Symbol('listComments');
   const listFiles = Symbol('listFiles');
   let reads = 0;
+  let pullReads = 0;
   const github = {
     paginate: async (endpoint) => (endpoint === listComments ? comments : files),
     graphql: async (_query, { id }) => {
@@ -89,7 +90,25 @@ function harness({ comments = [], files = [{ filename: 'docs/example.md' }], ref
       pulls: {
         listFiles,
         update: async (args) => calls.push(['updatePull', args]),
-        get: async () => ({ data: { state: reopenedState, head: { sha: reopenedHead || ref.object.sha } } }),
+        get: async () => {
+          const override = currentPulls[pullReads] || currentPulls[currentPulls.length - 1] || {};
+          pullReads += 1;
+          const opened = calls.some(([name]) => name === 'updatePull');
+          return { data: {
+            number: 17,
+            state: opened ? reopenedState : 'closed',
+            merged: false,
+            closed_at: CLOSED_AT,
+            changed_files: files.length,
+            head: {
+              sha: opened && reopenedHead ? reopenedHead : HEAD,
+              ref: 'codex/example',
+              repo: { full_name: 'example/project' },
+            },
+            ...currentPullOverrides,
+            ...override,
+          } };
+        },
       },
     },
   };
@@ -166,11 +185,32 @@ async function main() {
   assert.deepEqual(await guardUnmergedClosure(merged), { action: 'merged-noop' });
   assert.deepEqual(merged.calls, []);
 
+  const mergedAfterEvent = harness({ currentPullOverrides: { merged: true, state: 'closed' } });
+  assert.deepEqual(await guardUnmergedClosure(mergedAfterEvent), { action: 'merged-noop' });
+  assert.deepEqual(mergedAfterEvent.calls, []);
+
+  const reopenedAfterEvent = harness({ currentPullOverrides: { state: 'open', closed_at: null } });
+  assert.deepEqual(await guardUnmergedClosure(reopenedAfterEvent), { action: 'stale-event-noop' });
+  assert.deepEqual(reopenedAfterEvent.calls, []);
+
+  const supersededClosure = harness({ currentPullOverrides: { closed_at: '2026-09-06T05:00:00Z' } });
+  assert.deepEqual(await guardUnmergedClosure(supersededClosure), { action: 'stale-event-noop' });
+  assert.deepEqual(supersededClosure.calls, []);
+
   const receipted = harness({
     comments: [receiptComment()],
   });
   assert.deepEqual(await guardUnmergedClosure(receipted), { action: 'receipted-noop' });
   assert.deepEqual(receipted.calls, []);
+
+  const truncatedFiles = harness({
+    comments: [receiptComment()],
+    currentPullOverrides: { changed_files: 2 },
+  });
+  assert.deepEqual(await guardUnmergedClosure(truncatedFiles), { action: 'restored-and-reopened' });
+  assert.ok(truncatedFiles.calls.some(([name, args]) => name === 'comment' &&
+    args.body.includes('1 returned; 2 reported')));
+  assert.equal(truncatedFiles.failures.length, 1);
 
   const missing = harness();
   assert.deepEqual(await guardUnmergedClosure(missing), { action: 'restored-and-reopened' });
@@ -193,6 +233,11 @@ async function main() {
     assert.ok(!before.calls.some(([name]) => name === 'updatePull'));
     assert.equal(before.failures.length, 1);
   }
+  const closureMovedBeforeMutation = harness({
+    currentPulls: [{}, { closed_at: '2026-09-06T05:00:00Z' }],
+  });
+  assert.deepEqual(await guardUnmergedClosure(closureMovedBeforeMutation), { action: 'stale-event-noop' });
+  assert.deepEqual(closureMovedBeforeMutation.calls, []);
   for (const options of [
     { ref: { object: { sha: HEAD } }, refHeads: [HEAD, HEAD, 'f'.repeat(40)] },
     { ref: { object: { sha: HEAD } }, reopenedHead: 'f'.repeat(40) },

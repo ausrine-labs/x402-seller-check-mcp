@@ -88,10 +88,6 @@ async function guardUnmergedClosure({ github, context, core }) {
   if (!pull || !repository) {
     throw new Error('pull_request and repository payloads are required');
   }
-  if (pull.merged) {
-    return { action: 'merged-noop' };
-  }
-
   const owner = repository.owner.login;
   const repo = repository.name;
   const pullNumber = pull.number;
@@ -102,6 +98,22 @@ async function guardUnmergedClosure({ github, context, core }) {
   const authorizedActor = context.actor || (context.payload.sender && context.payload.sender.login);
   const authorizedActorId = context.payload.sender && context.payload.sender.id;
   const closedAt = pull.closed_at;
+  const matchesEventClosure = (current) => current && current.state === 'closed' &&
+    current.merged !== true && current.closed_at === closedAt && current.head &&
+    current.head.sha === headSha && current.head.ref === headRef &&
+    current.head.repo && current.head.repo.full_name === headRepo;
+  const fetchPull = async () => (await github.rest.pulls.get({
+    owner,
+    repo,
+    pull_number: pullNumber,
+  })).data;
+  const currentAtStart = await fetchPull();
+  if (pull.merged || currentAtStart.merged === true) {
+    return { action: 'merged-noop' };
+  }
+  if (!matchesEventClosure(currentAtStart)) {
+    return { action: 'stale-event-noop' };
+  }
   const currentHead = async () => {
     try {
       return (await github.rest.git.getRef({ owner, repo, ref: `heads/${headRef}` })).data.object.sha;
@@ -123,8 +135,12 @@ async function guardUnmergedClosure({ github, context, core }) {
     per_page: 100,
   });
   const sourcePaths = files.map((file) => file.filename);
+  const filesComplete = Number.isInteger(currentAtStart.changed_files) &&
+    currentAtStart.changed_files >= 0 && files.length === currentAtStart.changed_files &&
+    sourcePaths.every((path) => typeof path === 'string') &&
+    new Set(sourcePaths).size === sourcePaths.length;
 
-  if (await hasValidReceipt(comments, {
+  if (filesComplete && await hasValidReceipt(comments, {
     headSha,
     repositoryName,
     pullNumber,
@@ -141,13 +157,19 @@ async function guardUnmergedClosure({ github, context, core }) {
     '',
     'The governed lifecycle does not treat Close as completion. Review every changed file, then use the canonical `culturenet-brain/tools/retire-pr-branch.py` command with the full head SHA and Vilija’s exact approval.',
   ].join('\n');
+  const fileEnumerationNote = filesComplete ? '' :
+    `\n\nThe changed-file enumeration was incomplete or inconsistent (${files.length} returned; ${currentAtStart.changed_files} reported), so no retirement receipt could be accepted.`;
+
+  if (!matchesEventClosure(await fetchPull())) {
+    return { action: 'stale-event-noop' };
+  }
 
   if (headRepo !== repositoryName) {
     await github.rest.issues.createComment({
       owner,
       repo,
       issue_number: pullNumber,
-      body: `${explanation}\n\nThe head belongs to external repository \`${headRepo || 'unknown'}\`, so this guard could not safely restore or reopen it. Map Room review is required.`,
+      body: `${explanation}${fileEnumerationNote}\n\nThe head belongs to external repository \`${headRepo || 'unknown'}\`, so this guard could not safely restore or reopen it. Map Room review is required.`,
     });
     core.setFailed('Unreceipted fork-owned PR closure requires Map Room review.');
     return { action: 'fork-blocked' };
@@ -164,6 +186,9 @@ async function guardUnmergedClosure({ github, context, core }) {
   }
 
   if (!ref) {
+    if (!matchesEventClosure(await fetchPull())) {
+      return { action: 'stale-event-noop' };
+    }
     await github.rest.git.createRef({
       owner,
       repo,
@@ -175,7 +200,7 @@ async function guardUnmergedClosure({ github, context, core }) {
       owner,
       repo,
       issue_number: pullNumber,
-      body: `${explanation}\n\nThe branch now points to \`${ref.object.sha}\`, not the closed PR head \`${headSha}\`. The guard refused to overwrite it. Map Room review is required.`,
+      body: `${explanation}${fileEnumerationNote}\n\nThe branch now points to \`${ref.object.sha}\`, not the closed PR head \`${headSha}\`. The guard refused to overwrite it. Map Room review is required.`,
     });
     core.setFailed('Unreceipted PR closure found a changed branch head.');
     return { action: 'head-race-blocked' };
@@ -185,26 +210,26 @@ async function guardUnmergedClosure({ github, context, core }) {
   // expected-head parameter; a racing writer must be detected, never overwritten
   // or reported as a successfully restored exact head.
   const beforeOpen = await currentHead();
-  if (beforeOpen !== headSha) {
+  if (beforeOpen !== headSha || !matchesEventClosure(await fetchPull())) {
     core.setFailed('Branch changed before reopen; no ref was overwritten.');
     await github.rest.issues.createComment({ owner, repo, issue_number: pullNumber,
-      body: `${explanation}\n\nThe branch moved before reopen. No ref was overwritten; exact-head recovery requires owner review.` });
+      body: `${explanation}${fileEnumerationNote}\n\nThe branch or PR closure moved before reopen. No ref was overwritten; exact-head recovery requires owner review.` });
     return { action: 'head-race-blocked' };
   }
   await github.rest.pulls.update({ owner, repo, pull_number: pullNumber, state: 'open' });
   const afterOpen = await currentHead();
-  const reopened = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
-  if (afterOpen !== headSha || reopened.data.head.sha !== headSha || reopened.data.state !== 'open') {
+  const reopened = await fetchPull();
+  if (afterOpen !== headSha || reopened.head.sha !== headSha || reopened.state !== 'open') {
     core.setFailed('Head/state changed during reopen; exact-head recovery is unverified.');
     await github.rest.issues.createComment({ owner, repo, issue_number: pullNumber,
-      body: `${explanation}\n\nThe head or PR state moved during reopen. No ref was overwritten; the restored exact-head outcome is not verified and requires owner review.` });
+      body: `${explanation}${fileEnumerationNote}\n\nThe head or PR state moved during reopen. No ref was overwritten; the restored exact-head outcome is not verified and requires owner review.` });
     return { action: 'reopen-race-blocked' };
   }
   await github.rest.issues.createComment({
     owner,
     repo,
     issue_number: pullNumber,
-    body: `${explanation}\n\nThe exact branch head \`${headSha}\` was ${ref ? 'still present' : 'restored'} and this PR was reopened automatically.`,
+    body: `${explanation}${fileEnumerationNote}\n\nThe exact branch head \`${headSha}\` was ${ref ? 'still present' : 'restored'} and this PR was reopened automatically.`,
   });
   core.setFailed('Unmerged PR closure was reversed because its retirement receipt was missing.');
   return { action: ref ? 'reopened' : 'restored-and-reopened' };
